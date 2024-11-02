@@ -1,0 +1,203 @@
+import os
+import pandas as pd
+import re
+import decimal
+
+
+directory_path = r'XYZ'
+output_path = os.path.join(directory_path, "duplicates_summary.csv")
+matches_log_path = os.path.join(directory_path, "matched_files_log.csv")
+comparison_log_path = os.path.join(directory_path, "key_comparison_log.csv")
+cleaning_log_path = os.path.join(directory_path, "cleaning_log.csv")
+delimiter = '|'  # Define delimiter to combine columns
+
+# Lists to accumulate duplicate records, matched file pairs, comparison results, and cleaning logs
+duplicate_summary = []
+matched_pairs = []
+comparison_results = []
+cleaning_log = []  # Log cleaning steps
+
+# Get the base name for matching files with other files
+def get_base_name(filename):
+    return filename.replace("CMP - ", "").split('.')[0]
+
+# Clean data by removing special characters, standardizing numbers, and logging transformations
+def clean_data(value):
+    original_value = value
+    transformation = "None"
+    
+    # Initial cleaned_value set to original to compare later
+    cleaned_value = str(value).strip()
+    
+    # If value is a single special character (like "#", "/"), don't remove it as it may be the only identifier in some cases
+    if isinstance(value, str) and re.match(r"^[^\w\s]$", value.strip()):
+        transformation = "Preserved single special character"
+        cleaned_value = value.strip()
+    
+    else:
+        try:
+            # Convert to decimal to handle number formatting
+            dec = decimal.Decimal(value)
+            tup = dec.as_tuple()
+            delta = len(tup.digits) + tup.exponent
+            digits = ''.join(str(d) for d in tup.digits)
+            
+            if delta <= 0:
+                # Case where number is smaller than 1 with leading zeros after decimal
+                zeros = abs(tup.exponent) - len(tup.digits)
+                val = '0.' + ('0' * zeros) + digits
+                transformation = "Converted small decimal with leading zeros"
+            else:
+                # Standard number format without extra leading/trailing zeros
+                val = digits[:delta] + ('0' * tup.exponent) + '.' + digits[delta:]
+                transformation = "Standard number format with trailing zero removal"
+            
+            # Limit precision to avoid excessive precision for cases where it's not needed
+            cleaned_value = f"{decimal.Decimal(val).quantize(decimal.Decimal('.00001'))}".rstrip('0').rstrip('.')
+        
+        except:
+            # Handle nonnumeric values with special character removal only if not single character
+            if isinstance(value, str):
+                # Remove special characters only if they’re part of a larger string
+                if len(value.strip()) > 1:
+                    value = re.sub(r"[^\w\s]", "", value).strip()
+                    transformation = "Removed special characters and whitespace"
+                
+                # Remove leading zeros if value represents a number
+                if value.isdigit():
+                    value = value.lstrip("0") or "0"  # Keep one zero if all zeros
+                    transformation += " and removed leading zeros"
+            
+            cleaned_value = str(value).strip()  # Convert everything to string and strip whitespace
+
+    # Only log if the cleaned value differs from the original to avoid having a file with millions of rows
+    if cleaned_value != str(original_value).strip():
+        cleaning_log.append({
+            "Original_Value": original_value,
+            "Transformation": transformation,
+            "Cleaned_Value": cleaned_value
+        })
+
+    return cleaned_value
+
+# Iterate over each file in the directory to identify duplicates and construct keys
+file_list = os.listdir(directory_path)
+for filename in file_list:
+    file_path = os.path.join(directory_path, filename)
+
+    # Load CSV and Excel files
+    if filename.endswith('.csv'):
+        try:
+            data = pd.read_csv(file_path)
+            if data.empty:
+                print(f"Skipping empty file: {filename}")
+                continue
+        except pd.errors.EmptyDataError:
+            print(f"Skipping empty file: {filename}")
+            continue
+    elif filename.endswith(('.xls', '.xlsx')):
+        data = pd.read_excel(file_path, sheet_name=0)
+        if data.empty:
+            print(f"Skipping empty file: {filename}")
+            continue
+    else:
+        continue  
+    
+    # Replace NaN values with blanks, standardize blanks, and clean data
+    data = data.fillna("").applymap(clean_data)
+    
+    # Check for duplicate rows across all columns
+    duplicates = data[data.duplicated(keep=False)]
+    if not duplicates.empty:
+        duplicates = duplicates.assign(Source_File=filename)
+        duplicate_summary.append(duplicates)
+        data = data.drop_duplicates()
+    
+    # Create the Key column by concatenating all columns with the delimiter
+    data['Key'] = data.apply(lambda row: delimiter.join(row.values.astype(str)), axis=1)
+    
+    # Save the modified file back with the new key column
+    if filename.endswith('.csv'):
+        data.to_csv(file_path, index=False)
+    else:
+        data.to_excel(file_path, index=False)
+
+# Save all identified duplicates to a summary file
+if duplicate_summary:
+    duplicate_summary_df = pd.concat(duplicate_summary, ignore_index=True)
+    duplicate_summary_df.to_csv(output_path, index=False)
+    print(f"Duplicate rows have been saved in: {output_path}")
+else:
+    print("No duplicates found across all files.")
+
+# Match CMP files with non-CMP counterparts and log pairs
+for filename in file_list:
+    if "CMP - " in filename:
+        base_name = get_base_name(filename)
+        matched_file = next((f for f in file_list 
+                             if get_base_name(f) == base_name and "CMP" not in f), None)
+        
+        if matched_file:
+            matched_pairs.append({"CMP_File": filename, "Matched_File": matched_file})
+            print(f"Matched: {filename} with {matched_file}")
+        else:
+            print(f"No match found for CMP file: {filename}")
+
+# Save matched pairs to a log file
+matched_pairs_df = pd.DataFrame(matched_pairs)
+matched_pairs_df.to_csv(matches_log_path, index=False)
+
+
+# Compare keys between matched files and log results
+for pair in matched_pairs:
+    cmp_file = os.path.join(directory_path, pair['CMP_File'])
+    matched_file = os.path.join(directory_path, pair['Matched_File'])
+    
+    # Load both files with already modified key columns
+    if cmp_file.endswith('.csv'):
+        cmp_data = pd.read_csv(cmp_file)
+    elif cmp_file.endswith(('.xls', '.xlsx')):
+        cmp_data = pd.read_excel(cmp_file)
+
+    if matched_file.endswith('.csv'):
+        matched_data = pd.read_csv(matched_file)
+    elif matched_file.endswith(('.xls', '.xlsx')):
+        matched_data = pd.read_excel(matched_file)
+    
+    # Ensure that the Key column exists in both files
+    if 'Key' not in cmp_data.columns or 'Key' not in matched_data.columns:
+        print(f"Key column missing in one of the files: {pair['CMP_File']} or {pair['Matched_File']}")
+        continue
+
+    # Get unique keys from each file
+    cmp_keys = set(cmp_data['Key'].unique())
+    matched_keys = set(matched_data['Key'].unique())
+    
+    # Check for differences in key count and content
+    cmp_key_count = len(cmp_keys)
+    matched_key_count = len(matched_keys)
+    missing_in_matched = cmp_keys - matched_keys
+    missing_in_cmp = matched_keys - cmp_keys
+
+    # Log results for each comparison
+    result = {
+        "CMP_File": pair['CMP_File'],
+        "Matched_File": pair['Matched_File'],
+        "CMP_Key_Count": cmp_key_count,
+        "Matched_Key_Count": matched_key_count,
+        "Keys_Missing_in_Matched": len(missing_in_matched),
+        "Keys_Missing_in_CMP": len(missing_in_cmp),
+        "Mismatch_Details_Missing_in_Matched": list(missing_in_matched)[:5],
+        "Mismatch_Details_Missing_in_CMP": list(missing_in_cmp)[:5]
+    }
+    comparison_results.append(result)
+
+# Save key comparison results to a log file
+comparison_results_df = pd.DataFrame(comparison_results)
+comparison_results_df.to_csv(comparison_log_path, index=False)
+print(f"Key comparison results have been saved in: {comparison_log_path}")
+
+# Save the data cleaning log
+cleaning_log_df = pd.DataFrame(cleaning_log)
+cleaning_log_df.to_csv(cleaning_log_path, index=False)
+print(f"Data cleaning log has been saved in: {cleaning_log_path}")
