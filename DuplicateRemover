@@ -1,0 +1,1050 @@
+import os
+import pandas as pd
+from rapidfuzz import process, fuzz
+import re
+from pathlib import Path
+from datetime import datetime
+from docx import Document
+import random
+from docx.shared import RGBColor
+from dateutil import parser
+import numpy as np
+from pandas.io.excel import ExcelWriter
+import csv
+
+current_directory = Path(os.getcwd())
+
+def adjust_and_format_date(date_str, column_name=None):
+    if isinstance(date_str, str) and column_name and "Contract ID/Name" in column_name:
+        return date_str 
+    
+    if column_name and any(keyword in column_name.lower() for keyword in ["flat"]):
+        return date_str
+
+    if isinstance(date_str, str) and date_str.isdigit() and len(date_str) < 10:
+        return date_str
+    
+    if column_name and "phone" in column_name.lower():
+        return clean_phone_number(date_str)
+
+    if isinstance(date_str, str) and "-" in date_str and date_str.replace("-", "").isdigit():
+        return date_str
+    
+    if not isinstance(date_str, str) or len(date_str) > 100:
+        return date_str
+
+    try:
+        date_object = datetime.strptime(date_str, "%d %B %Y")  
+        return date_object.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+    try:
+        date_object = datetime.strptime(date_str, "%d/%m/%Y")  
+        return date_object.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+    try:
+        date_object = parser.parse(date_str)
+        return date_object.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, TypeError):
+        return date_str
+
+def insert_space_if_missing(date_str):
+    match = re.match(r'^(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})(\d{2}:\d{2}(:\d{2})?)$', date_str)
+    if match:
+        date_str = match.group(1) + ' ' + match.group(2)
+    return date_str
+
+def check_first_part_blank(key, delimiter="|"):
+    first_part = key.split(delimiter)[0] if key else ""
+    if first_part.strip() == "" or first_part.strip().lower() == "<empty>":
+        return "Blank Code"
+    # Check if the first part is filled but the rest of the fields are <empty>
+    if all(part.strip().lower() == "<empty>" for part in key.split(delimiter)[1:]):
+        return "Nothing to import"
+    return None
+
+def are_pks_equivalent(key1, key2, delimiter="|"):
+    pk1 = key1.split(delimiter)[0]
+    pk2 = key2.split(delimiter)[0]
+    
+    return pk1 == pk2
+
+def clean_value(value):
+    return value.strip() if isinstance(value, str) else value
+
+def clean_phone_number(phone):
+    if isinstance(phone, str):
+        phone = phone.strip()
+
+        # Remove any non-numeric characters, including spaces, parentheses, slashes, etc.
+        phone = re.sub(r'[^\d]', '', phone)
+
+        # If the phone number starts with '+', keep the plus sign but remove other characters
+        if phone.startswith('+'):
+            phone = '+' + re.sub(r'[^\d]', '', phone[1:])
+        
+        # Remove "ext" and any following digits (if present)
+        phone = re.sub(r'ext\d*', '', phone, flags=re.IGNORECASE)
+        
+    return phone
+
+def is_AVBAVB_jklajsdkl_file(filename):
+    # Check if the file name indicates it's a AVBAVBjklajsdkl file
+    return 'AVBAVBjklajsdkl' in filename
+
+def normalize_jklajsdkl_pair(key, delimiter="|"):
+    # Sort the jklajsdkl pair in ascending order so that "A|B" and "B|A" become the same
+    parts = key.split(delimiter)
+    if len(parts) == 2:
+        parts.sort()
+        return delimiter.join(parts)
+    return key
+    
+
+def format_value(value, column_name=None):
+    # If the value is a datetime object, return it in the desired format
+    if isinstance(value, pd.Timestamp) or isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, str):
+        # Define phone-related columns
+        phone_columns = ['KLJKA Mobile Phone', 'KLJKA Work Phone', 'AVBAVB Contact Mobile Phone', 'AVBAVB Contact Work Phone', 'AVBAVB Mobile Phone ', 'AVBAVB Mobile Phone']
+        # Check if the column is one of the phone-related columns
+        if column_name and any(phone_column in column_name for phone_column in phone_columns):
+            # Clean phone number by removing any non-numeric characters (e.g., '-', ':')
+            cleaned_value = re.sub(r'[^0-9]', '', value)  # Remove anything that is not a digit
+            # Ensure we only return digits as the cleaned value
+            return cleaned_value
+        # General case: strip leading zeros for non-phone columns
+        return value.lstrip()
+    try:
+        # Handle numeric values as floats, formatting them to an integer if necessary
+        float_value = float(value)
+        # Convert float to integer if the value is close to an integer or if it's zero with extra decimals
+        if float_value.is_integer():
+            return int(float_value)  # Convert to integer if it's a whole number
+        # If it's a float with more than necessary decimal places, round it and return as an integer
+        return round(float_value)
+    except (ValueError, TypeError):
+        return str(value).strip()
+    
+
+
+def extract_keys(df, filename, delimiter="|"):
+ 
+    # Add specific columns to ignore for YUITYURTY files
+    if 'YUITYURTY' in filename:
+        columns_to_ignore += ['HJKLJL', 'HJKLJL ']
+ 
+    # Normalize jklajsdkl pairs for AVBAVBjklajsdkl files only
+    if 'Key' not in df.columns:
+        # Drop columns that should be ignored (like 'EEEE')
+        df_filtered = df.drop(columns=columns_to_ignore, errors='ignore')
+        # Apply date formatting or other normalization to the object-type columns
+        for col in df_filtered.select_dtypes(include=['object']):
+            df_filtered[col] = df_filtered[col].apply(lambda x: adjust_and_format_date(x) if isinstance(x, str) else x)
+        # Normalize keys here, but only apply jklajsdkl normalization if it's a AVBAVBjklajsdkl file
+        df_filtered['Key'] = df_filtered.apply(lambda row: delimiter.join(
+            normalize_key(clean_value(format_value(value))) if pd.notna(value) and str(value).strip() else '<empty>' 
+            for value in row
+        ), axis=1)
+        if is_AVBAVB_jklajsdkl_file(filename):  # Apply jklajsdkl normalization only for AVBAVBjklajsdkl files
+            df_filtered['Key'] = df_filtered['Key'].apply(lambda key: normalize_jklajsdkl_pair(key))
+    # Return the dataframe with the key column, ensuring that empty keys are excluded
+    return df_filtered[df_filtered['Key'] != ""]
+    
+def normalize_key(key):
+    # Ensure key is treated as a string
+    key = str(key).replace("\n", "").replace("\r", "").strip()  
+    key = re.sub(r"[\'\",_\s]", '', key)  # Clean unwanted characters
+
+    # Remove time portion if it's 00:00:00
+    key = re.sub(r"(\d{4}-\d{2}-\d{2})00:00:00", r"\1", key)
+
+    # Fix missing space between date and time
+    key = re.sub(r"(\d{4}-\d{2}-\d{2})(\d{2}:\d{2}(:\d{2})?)", r"\1", key)
+
+    return key.lower()
+
+def check_all_fields_empty(key, delimiter="|"):
+    parts = key.split(delimiter)
+    if len(parts) > 1 and all(part.strip().lower() == "<empty>" for part in parts):
+        return True
+    return False
+
+def replace_empty_values(df):
+    empty_values = [
+        'Not Collected', 'not collected', 'NotCollected', 'notcollected', 
+        'na', 'n/a', 'N/A', 'No Information', 'no information', 
+        'NoInformation', 'Noinformation', 'noinformation', 
+        'none', 'None', 'null', 'Null', 'missing', 'Missing', '1900-01-01 00:00:00',
+        '1900-01-0100:00:00', '01/01/1900', '01/01/1900 00:00:00', '1900-01-01', '1900-01-01 00:00:00.000',
+        '<NONE>', '<None>'
+    ]
+    
+    for col in df.columns:
+        df[col] = df[col].apply(lambda x: '<empty>' if str(x).strip() in empty_values else x)
+
+    return df    
+
+def normalize_column_values(value):
+    """
+    Normalizes a single column value by removing or replacing dashes and other adjustments.
+    """
+    if isinstance(value, str):
+        # Replace dashes with spaces
+        value = value.replace('-', ' ')
+        # Optionally, you can normalize further (e.g., case folding, removing extra spaces)
+        value = value.lower().strip()
+    return value
+
+def normalize_text(text):
+    # Remove punctuation and convert text to lowercase
+    return re.sub(r'[^a-zA-Z0-9\s]', '', text).strip().lower()
+
+
+
+
+def map_boolean_values(df):
+    true_values = ['t', 'T', 'true', 'TRUE', 'True', 'Y', 'Yes', 'YES', 'y', 'yes', 'QT', 'qt', 'Qt']
+    false_values = ['f', 'F', 'false', 'FALSE', 'False', 'No', 'no', 'n', 'N', 'NO', 'NQ', 'nq', 'Nq']
+    
+    gender_columns = ['gender', 'sex', 'Gender', 'Sex', 'GENDER', 'SEX']
+    
+    for col in df.columns:
+        if col.strip().lower() in [gender.strip().lower() for gender in gender_columns]:
+            continue
+        
+        df[col] = df[col].apply(lambda x: 1 if str(x).strip().lower() in true_values else 0 if str(x).strip().lower() in false_values else x)
+    
+    return df
+
+def is_all_filler_values(key, delimiter="|", filler_values=None, file_name=None):
+    if filler_values is None:
+        filler_values = {"<empty>", "0", "EEEE", "DDDD"}
+
+    parts = key.split(delimiter)
+    # Skip the first part (ID) and check the rest
+    for part in parts[1:]:
+        if part.strip().lower() not in filler_values:
+            return False
+
+    # Additional check if the file is bbb
+    if file_name and "bbb" in file_name:
+        return True
+
+    return True
+
+def standardize_numeric_values(df):
+    """
+    Standardize numeric values in the dataframe by removing trailing zeros after the decimal point.
+    Converts numeric values like 1.000, 1.0000, etc., to 1, 2.000 to 2, etc.
+    :param df: The dataframe to be processed.
+    :return: The dataframe with standardized numeric values.
+    """
+    # Define columns that are numeric and need to be standardized
+    columns_to_check = ['CCCC', 'CCCC ', 'BBBB', 'BBBB ' , 'AAAA ', 'AAAA']
+ 
+    for col in columns_to_check:
+        if col in df.columns:
+            # Replace numeric values with string equivalents, removing trailing zeros
+            # Convert the value to a string and remove trailing zeros after the decimal
+            df[col] = df[col].apply(lambda x: str(float(x)).rstrip('0').rstrip('.') if isinstance(x, str) else x)
+ 
+    return df
+
+def load_file(file_path):
+    df = None
+ 
+    # Step 1: Load the file based on type
+    if "AJFAAJFA" in file_path.name and file_path.suffix == '.xlsx':
+        df_dict = pd.read_excel(file_path, dtype=str, sheet_name=None)  # Load all sheets as a dictionary
+        if "AJFAAJFA" in df_dict:
+            df = df_dict["AJFAAJFA"]
+        else:
+            raise ValueError(f"Sheet 'AJFAAJFA' not found in {file_path.name}")
+    elif file_path.suffix == '.xlsx':
+        df = pd.read_excel(file_path, dtype=str)  # Default behavior
+    elif file_path.suffix == '.csv':
+        df = pd.read_csv(file_path, dtype=str)
+    else:
+        raise ValueError(f"Unsupported file type for {file_path}")
+ 
+    if df is None:
+        raise ValueError("DataFrame could not be loaded.")
+ 
+
+    # Clean phone number columns
+    phone_columns = [
+        'AVBAVB Contact Home Phone', 
+        'AVBAVB Contact Home Phone ', 
+        'AVBAVB Contact Mobile Phone', 
+        'AVBAVB Contact Mobile Phone ', 
+        'AVBAVB Contact Work Phone',
+        'AVBAVB Contact Work Phone ',
+        'KLJKA Mobile Phone', 
+        'KLJKA Work Phone',
+        'KLJKA Work Phone ',
+        'Contact Home Phone',
+        'Contact Home Phone ',
+        'Contact Mobile Phone',
+        'Contact Mobile Phone ',
+        'Contact Work Phone',
+        'Contact Work Phone ',
+        'AVBAVB Mobile Phone',
+        'AVBAVB Mobile Phone ',
+        'AVBAVB Telephone', 
+        'AVBAVB Telephone '  
+    ]
+    
+    for col in phone_columns:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_phone_number)
+
+    df = standardize_numeric_values(df)
+
+    # Perform other transformations
+    df = replace_empty_values(df)
+    df = map_boolean_values(df)
+
+
+
+        if 'HJKLJL' in df.columns and 'LKJALS' in df.columns:
+            # Replace NaN or None with an empty string
+            df['HJKLJL'] = df['HJKLJL'].replace(['nan', None], '').fillna('')
+            df['LKJALS'] = df['LKJALS'].replace(['nan', None], '').fillna('')
+            
+            # Normalize the text to remove punctuation and make it lowercase
+            df['HJKLJL'] = df.apply(lambda row: " ".join(sorted([normalize_text(row['HJKLJL']), normalize_text(row['LKJALS'])])), axis=1)
+            
+            # Assign the combined 'HJKLJL' back to 'LKJALS'
+            df['LKJALS'] = df['HJKLJL']
+
+        return df
+
+def are_keys_equivalent(key1, key2, delimiter="|"):
+    segments1 = sorted(key1.split(delimiter))
+    segments2 = sorted(key2.split(delimiter))
+    return segments1 == segments2
+
+def are_keys_equivalent_AVBAVB_contacts(key1, key2, delimiter="|", file_name=None):
+    # Check if the file is a GGG file
+    if file_name and "GGG" in file_name:
+        # Extract components from the keys
+        key1_parts = key1.split(delimiter)
+        key2_parts = key2.split(delimiter)
+        
+        # Ensure the first part (ID) matches
+        if key1_parts[0] != key2_parts[0]:
+            return False
+        
+        # Ensure Forename (2nd part) and Surname (4th part) also match
+        forename_match = key1_parts[2].strip().lower() == key2_parts[2].strip().lower()
+        surname_match = key1_parts[4].strip().lower() == key2_parts[4].strip().lower()
+        
+        # Match only if both Forename and Surname match
+        return forename_match and surname_match
+    
+    # For non-GGG files, fall back to the kkkkal key comparison
+    return are_keys_equivalent(key1, key2, delimiter)
+
+def convert_date_format(date_str):
+    if isinstance(date_str, str):
+        date_str = re.sub(r"(\d{4}-\d{2}-\d{2})(\d{2}:\d{2}(:\d{2})?)", r"\1 \2", date_str)
+        
+        date_str = date_str.replace("23:59:59", "00:00:00")
+        
+        try:
+            date_object = datetime.strptime(date_str, "%d/%m/%Y %H:%M")
+            return date_object.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+        
+        try:
+            date_object = parser.parse(date_str)
+            return date_object.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return date_str
+    return date_str
+
+def extract_meaningful_part(filename):
+    filename = re.sub(r"(_FDE|_ABC)$", '', filename).strip()
+    match = re.search(r"(_[A-Za-z]+)$", filename) 
+    if match:
+        return filename 
+    return filename  
+
+def extract_source(filename):
+    return filename.split('_')[-1].replace('.xlsx', '')
+
+def extract_school_id(filename):
+    return filename.split('_')[0]
+    
+
+def extract_file_name(filename):
+    parts = filename.split('_')
+    if len(parts) > 2:
+        return '_'.join(parts[1:-1]) 
+    return filename
+school_id = None
+
+FDE_files = [f for f in current_directory.iterdir() if f.is_file() and f.name.endswith("_FDE.xlsx")]
+non_prefixed_files = [f for f in current_directory.iterdir() if f.is_file() and f.name.endswith("_ABC.xlsx")]
+
+print(f"Found FDE files: {[f.name for f in FDE_files]}")
+print(f"Found non-prefixed (ABC) files: {[f.name for f in non_prefixed_files]}")
+
+matches = []
+for FDE_file in FDE_files:
+    school_id = extract_school_id(FDE_file.name)
+    file_name = extract_file_name(FDE_file.name)
+    source = extract_source(FDE_file.name)
+
+    if not school_id:
+        school_id = extract_school_id(FDE_file.name)
+        print(f"Extracted School ID: {school_id}")  
+
+    matching_files = [
+        ABC_file for ABC_file in non_prefixed_files
+        if extract_school_id(ABC_file.name) == school_id and extract_file_name(ABC_file.name) == file_name
+    ]
+
+
+    if matching_files:
+        matches.append((FDE_file, matching_files[0]))
+    else:
+        print(f"No match found for {FDE_file.name}.")
+
+print(f"Total matched files: {len(matches)}")
+for FDE_file, ABC_file in matches:
+    print(f"Matched: {FDE_file.name} <-> {ABC_file.name}")
+
+exact_matches_output = []
+close_matches_output = []
+unmatched_keys_output = []
+total_exact_matches = 0
+total_close_matches = 0
+total_keys_in_FDE = 0
+total_keys_in_non_prefixed = 0
+similarity_threshold = 0
+
+all_matched_keys = set()
+
+def get_pk_from_key(key, delimiter="|"):
+    return key.split(delimiter)[0]
+
+file_record_counts = {}
+aaa_blank_xytzt_data = {}
+
+
+for FDE_file, matched_file in matches:
+    try:
+
+        
+        print(f"Processing files: {FDE_file.name} and {matched_file.name}")
+
+        non_prefixed_df = extract_keys(load_file(matched_file), matched_file.name)  # Pass filename
+        FDE_df = extract_keys(load_file(FDE_file), FDE_file.name) 
+
+        if 'YUITYURTY' in FDE_file.name:
+            # Ensure ABCKLJKAID column exists and is numeric
+            if 'ABCKLJKAID' in FDE_df.columns:
+                FDE_df['ABCKLJKAID'] = pd.to_numeric(FDE_df['ABCKLJKAID'], errors='coerce')  # Convert to numeric, set invalid entries to NaN
+
+                # Filter rows where ABCKLJKAID is 35
+                FDE_df2 = FDE_df[FDE_df["ABCKLJKAID"] == 35]  # Compare to 35 as a number
+
+                if FDE_df2.empty:
+                    print(f"No rows found for ABCKLJKAID = 35 in {FDE_file.name}.")
+                    print(f"ABCKLJKAID unique values: {FDE_df['ABCKLJKAID'].unique()}")  # Debug: check unique values
+                else:
+                    print(f"Rows for ABCKLJKAID = 35 in {FDE_file.name}:")
+                    print(FDE_df2)
+            else:
+                print(f"'ABCKLJKAID' column not found in {FDE_file.name}.")
+
+
+
+        print(f"ABC df:\n{non_prefixed_df.head()}")
+        print(f"FDE df: \n{FDE_df.head()}")
+
+        if "aaa" in matched_file.name and "_ABC" in matched_file.name.lower():
+            xytzt_column = "xytzt date"  # Adjust if column name differs
+            if xytzt_column in non_prefixed_df.columns:
+                blank_xytzt_rows = non_prefixed_df[
+                    non_prefixed_df[xytzt_column].isna() | 
+                    (non_prefixed_df[xytzt_column].str.strip() == '')
+                ]
+                # Extract values from the first column dynamically
+                first_column_values = blank_xytzt_rows.iloc[:, 0].tolist()
+                aaa_blank_xytzt_data[matched_file.name] = first_column_values
+                print(f"XYTZT Date entries in {matched_file.name}: {first_column_values}")
+            else:
+                print(f"Column '{xytzt_column}' not found in {matched_file.name}")
+
+
+        if 'Key' in FDE_df.columns and 'Key' in non_prefixed_df.columns:
+            FDE_df['Key'] = FDE_df['Key'].astype(str).str.replace("23:59:59", "00:00:00")
+            non_prefixed_df['Key'] = non_prefixed_df['Key'].astype(str).str.replace("23:59:59", "00:00:00")
+        else:
+            raise ValueError("Key column is missing in one or both DataFrames!")
+
+        FDE_keys = set(FDE_df['Key'])
+        matched_keys = set(non_prefixed_df['Key'])
+
+        total_keys_in_FDE += len(FDE_keys)
+        total_keys_in_non_prefixed += len(matched_keys)
+
+        file_record_counts[(FDE_file.name, matched_file.name)] = {
+            'FDE_count': len(FDE_df),
+            'ABC_count': len(non_prefixed_df)
+        }
+
+        exact_matches = FDE_keys.intersection(matched_keys)
+        total_exact_matches += len(exact_matches)
+        all_matched_keys.update(exact_matches)  
+        print(f"\nComparing Key columns in {FDE_file.name} and {matched_file.name}:")
+        print(f"FDE Keys: {len(FDE_df['Key'])}" )
+        print(f"ABC Keys: {len(non_prefixed_df['Key'])}" )
+        print(f"Exact matches found: {len(exact_matches)}")
+
+        for key in exact_matches:
+            status = check_first_part_blank(key)
+            exact_matches_output.append({
+                "Check Direction": "FDE to ABC",
+                "File1": FDE_file.name,
+                "File2": matched_file.name,
+                "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                "Exact Key": key,
+                "Note": status  # Add the 'Status' column
+            })
+
+        unmatched_FDE_keys = {normalize_key(key) for key in FDE_keys - exact_matches}
+        unmatched_non_prefixed_keys = {normalize_key(key) for key in matched_keys - exact_matches}
+        close_match_count = 0
+
+        # After loading and preprocessing dataframes
+        print("Initial FDE DataFrame (before filtering):")
+        print(FDE_df)
+        print("Initial ABC DataFrame (before filtering):")
+        print(non_prefixed_df)
+
+        # Log Keys
+        print("FDE Keys (before normalization):", FDE_keys)
+        print("ABC Keys (before normalization):", matched_keys)
+        normalized_FDE_keys = {normalize_key(key) for key in FDE_keys}
+        normalized_ABC_keys = {normalize_key(key) for key in matched_keys}
+        print("FDE Keys (after normalization):", normalized_FDE_keys)
+        print("ABC Keys (after normalization):", normalized_ABC_keys)
+
+        for key in unmatched_FDE_keys:
+            best_match = process.extractOne(key, unmatched_non_prefixed_keys, scorer=fuzz.ratio)
+            
+            if best_match and are_pks_equivalent(key, best_match[0]):
+                print(f"FDE Key: {key}, Best Match: {best_match[0]}, Similarity Score: {best_match[1]}")
+                FDE_values = key.split('|')
+                matched_values = best_match[0].split('|')
+
+                # Specific logic for bbb
+                if "bbb" in FDE_file.name:
+                    FDE_start_date = FDE_values[2] if len(FDE_values) > 2 else "<empty>"
+                    FDE_end_date = FDE_values[4] if len(FDE_values) > 4 else "<empty>"
+                    ABC_start_date = matched_values[2] if len(matched_values) > 2 else "<empty>"
+                    ABC_end_date = matched_values[4] if len(matched_values) > 4 else "<empty>"
+
+                    # Enhanced Key ID and Date Match Check
+                    if (FDE_values[0] == matched_values[0] and
+                        FDE_start_date == ABC_start_date and
+                        FDE_end_date == ABC_end_date):
+
+                        total_close_matches += 1
+                        close_match_count += 1
+                        unmatched_non_prefixed_keys.remove(best_match[0])
+
+                        # Generate detailed mismatch analysis
+                        issue_columns = []
+                        differences = []
+
+                        # Compare all relevant fields in the keys
+                        key_fields = ["Key ID", "Start Date", "kkkk", "End Date", "oooo", "tttt", "yyyy"]
+                        for i, (FDE_part, ABC_part) in enumerate(zip(FDE_values, matched_values)):
+                            if FDE_part != ABC_part:
+                                column_name = key_fields[i] if i < len(key_fields) else f"Column {i+1}"
+                                issue_columns.append(column_name)
+                                differences.append(
+                                    f"Column '{column_name}' mismatch: ABC='{ABC_part}' -> FDE='{FDE_part}'"
+                                )
+
+                        # Check if existing entry already contains differences
+                        existing_entry = next(
+                            (entry for entry in close_matches_output if entry["FDE Key"] == key and entry["ABC Key"] == best_match[0]),
+                            None
+                        )
+
+                        if existing_entry:
+                            # Merge existing issues and differences
+                            existing_entry["Issue Column"] = ", ".join(set(existing_entry.get("Issue Column", "").split(", ") + issue_columns))
+                            existing_entry["Differences"] = "; ".join(set(existing_entry.get("Differences", "").split("; ") + differences))
+                            existing_entry["Note"] = "Matching on Key and Dates with additional differences"
+                        else:
+                            # Append a new entry with the detailed differences
+                            close_matches_output.append({
+                                "File1": FDE_file.name,
+                                "File2": matched_file.name,
+                                "Check Direction": "FDE to ABC",
+                                "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                                "ABC Key": best_match[0],
+                                "FDE Key": key,
+                                "Issue Column": ", ".join(issue_columns) if issue_columns else "Key ID, Start Date, End Date Match",
+                                "Differences": "; ".join(differences) if differences else "Aligned Key IDs, Start Dates, and End Dates detected.",
+                                "Note": "Matching on Key and Dates" if not differences else "Matching on Key with differences detected"
+                            })
+                        continue  # Skip further processing for this match
+
+                    # Fallback for Start/End Date Mismatch
+                    if not (FDE_start_date == ABC_start_date and FDE_end_date == ABC_end_date):
+                        unmatched_keys_output.append({
+                            "File": FDE_file.name,
+                            "Check Direction": "FDE to ABC",
+                            "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                            "Unmatched Key": key,
+                            "Issues": "Start/End Date mismatch",
+                            "Note": f"Start/End Date mismatch: ABC ({ABC_start_date}, {ABC_end_date}) -> "
+                                    f"FDE ({FDE_start_date}, {FDE_end_date})"
+                        })
+                        continue
+
+                        
+                if "GGG" in FDE_file.name:
+                    # Apply additional logic for GGG
+                    FDE_values = key.split('|')
+                    matched_values = best_match[0].split('|')
+
+                    # Check Forename and Surname match
+                    forename_match = FDE_values[2].strip().lower() == matched_values[2].strip().lower()
+                    surname_match = FDE_values[4].strip().lower() == matched_values[4].strip().lower()
+
+                    if not (forename_match and surname_match):
+                        # Skip this match if Forename and Surname do not match
+                        unmatched_keys_output.append({
+                            "File": FDE_file.name,
+                            "Check Direction": "FDE to ABC",
+                            "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                            "Unmatched Key": key,
+                            "Issues": "Forename/Surname mismatch",
+                            "Note": "Failed Forename/Surname validation for GGG"
+                        })
+                        continue
+
+                if best_match[1] >= similarity_threshold:
+                    total_close_matches += 1
+                    close_match_count += 1
+                    unmatched_non_prefixed_keys.remove(best_match[0])
+                    
+                    all_matched_keys.add(key)
+                    all_matched_keys.add(best_match[0])
+
+                    FDE_values = key.split('|')
+                    matched_values = best_match[0].split('|')
+                    differences = []  
+
+                    if are_keys_equivalent(key, best_match[0]):
+                        match_type = "Reordered Close Match" 
+                        differences.append("Values are reordered but match")
+                    else:
+                        match_type = []  
+                        for i, (FDE_val, matched_val) in enumerate(zip(FDE_values, matched_values)):
+                            if FDE_val != matched_val:
+                                # Skip differences caused by '(ignored)'
+                                if FDE_val.strip().lower() == "(ignored)" or matched_val.strip().lower() == "(ignored)":
+                                    continue
+                                
+                                column_name = FDE_df.columns[i]
+
+                                # Normalize phone numbers before comparison
+                                if 'phone' in column_name.lower():  # Check if it's a phone number column
+                                    FDE_val = clean_phone_number(FDE_val)
+                                    matched_val = clean_phone_number(matched_val)
+
+                                # Now compare the cleaned values
+                                if FDE_val != matched_val:
+                                    differences.append(f"Column '{column_name}' mismatch: ABC Value '{matched_val}' -> FDE Value '{FDE_val}'")
+                                    match_type.append(column_name)
+
+                        if not differences:
+                            match_type_str = "All issues caused by '(ignored)'"
+                        else:
+                            match_type_str = ", ".join(match_type) if match_type else "No specific mismatch"
+
+                    status = "Potential Match Found"  # Update note to say "Potential Match Found"
+                    close_matches_output.append({
+                        "File1": FDE_file.name,
+                        "File2": matched_file.name,
+                        "Check Direction": "FDE to ABC",
+                        "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                        "ABC Key": best_match[0],
+                        "FDE Key": key,
+                        "Issue Column": match_type_str,
+                        "Differences": "; ".join(differences),
+                        "Note": status  # Add the 'Status' column
+                    })
+
+        for unmatched_key in unmatched_FDE_keys:
+            if unmatched_key not in all_matched_keys:
+                # Check if all fields are empty or the first part is filled but the rest are empty
+                status = check_first_part_blank(unmatched_key)
+                print(f"Key: {key}, Status: {status}")
+                if status == "Nothing to import":
+                    # Log this key as "Nothing to import" and skip further processing
+                    close_matches_output.append({
+                        "File1": FDE_file.name,
+                        "File2": matched_file.name,
+                        "Check Direction": "FDE to ABC",
+                        "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                        "ABC Key": "<No Match>",
+                        "FDE Key": unmatched_key,
+                        "Issue Column": "Nothing to import", 
+                        "Differences": "Nothing to import",  
+                        "Note": "Nothing to import",  
+                        "Match Status": "Nothing to import"
+                    })
+                    continue  # Skip further processing for this unmatched key
+        
+                # Skip this key if all fields are empty
+                if check_all_fields_empty(unmatched_key):
+                    continue  # Skip adding this to the output as it's a special case
+        
+                # For non-empty unmatched keys, check for a match
+                if check_first_part_blank(unmatched_key):
+                    issue_column = "Blank Code"
+                else:
+                    issue_column = "No specific match found"
+                    close_matches_output.append({
+            "File1": FDE_file.name,
+            "File2": matched_file.name,
+            "Check Direction": "FDE to ABC",
+            "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+            "ABC Key": "<No Match>",
+            "FDE Key": unmatched_key,
+            "Issue Column": "No specific match found",
+            "Differences": "Missing in ABC",
+            "Note": "Missing in ABC",
+            "Match Status": "Missing in ABC"
+        })
+        print("Duplicate Rows in FDE DataFrame:")
+        print(FDE_duplicates)
+        print("Duplicate Rows in ABC DataFrame:")
+        print(ABC_duplicates)
+        for unmatched_key in unmatched_non_prefixed_keys:
+            if unmatched_key not in all_matched_keys:
+                status = check_first_part_blank(unmatched_key)
+                if status == "Nothing to import":
+                    close_matches_output.append({
+                        "File1": FDE_file.name,
+                        "File2": matched_file.name,
+                        "Check Direction": "ABC to FDE",
+                        "Field Names": ", ".join([col for col in non_prefixed_df.columns if col != 'Key']),
+                        "ABC Key": unmatched_key,
+                        "FDE Key": "<No Match>",
+                        "Issue Column": "Nothing to import",  
+                        "Differences": "Nothing to import",  
+                        "Note": "Nothing to import", 
+                        "Match Status": "Nothing to import"
+                    })
+                    continue  
+        
+                if check_all_fields_empty(unmatched_key):
+                    continue  
+        
+                # For non-empty unmatched keys, check for a match
+                if check_first_part_blank(unmatched_key):
+                    issue_column = "Blank Code"
+                else:
+                    issue_column = "No specific match found"
+                    close_matches_output.append({
+            "File1": FDE_file.name,
+            "File2": matched_file.name,
+            "Check Direction": "ABC to FDE",
+            "Field Names": ", ".join([col for col in non_prefixed_df.columns if col != 'Key']),
+            "ABC Key": unmatched_key,
+            "FDE Key": "<No Match>",
+            "Issue Column": "No specific match found",
+            "Differences": "Missing in FDE",
+            "Note": "Missing in FDE",
+            "Match Status": "Missing in FDE"
+        })
+
+        filtered_close_matches_output = []
+        for match in close_matches_output:
+            # Parse the differences string into individual issues
+            issues = match['Differences'].split("; ")
+
+            # Check if all issues are caused by "(ignored)"
+            if all("(ignored)" in issue for issue in issues):
+                continue  # Skip this match if all issues are due to "(ignored)"
+
+            ABC_key = match.get("ABC Key", "")
+            FDE_key = match.get("FDE Key", "")
+            file_name = match.get("File1", "")
+
+            if ABC_key == "<No Match>" and FDE_key and not is_all_filler_values(FDE_key, file_name=file_name):
+                match["Differences"] = "Missing in ABC"
+                match["Note"] = "Missing in ABC"
+            elif is_all_filler_values(ABC_key, file_name=file_name) and match.get("Issue Column") == "No specific match found":
+                match["Differences"] = "All filler values, can be ignored"
+                match["Note"] = "Filler values only"
+
+            # Retain the match if there are genuine issues alongside "(ignored)"
+            filtered_close_matches_output.append(match)
+
+        # Replace the close_matches_output with the updated version
+        close_matches_output = filtered_close_matches_output
+
+        FDE_duplicates = FDE_df[FDE_df.duplicated('Key', keep=False)].copy()
+        ABC_duplicates = non_prefixed_df[non_prefixed_df.duplicated('Key', keep=False)].copy()
+
+        FDE_duplicates['PK'] = FDE_duplicates['Key'].apply(get_pk_from_key)
+        ABC_duplicates['PK'] = ABC_duplicates['Key'].apply(get_pk_from_key)
+
+        unmatched_keys_output.extend(
+            {
+                "File": FDE_file.name,
+                "Check Direction": "FDE to ABC",
+                "Field Names": ", ".join([col for col in FDE_df.columns if col != 'Key']),
+                "Unmatched Key": key,
+                "Issues": "Missing in ABC",
+                "Note": check_first_part_blank(key)  # Add the 'Status' column
+            }
+            for key in unmatched_FDE_keys if key not in all_matched_keys
+        )
+
+        unmatched_keys_output.extend(
+            {
+                "File": matched_file.name,
+                "Check Direction": "ABC to FDE",
+                "Field Names": ", ".join([col for col in non_prefixed_df.columns if col != 'Key']),
+                "Unmatched Key": key,
+                "Issues": "Missing in FDE",
+                "Note": check_first_part_blank(key)  # Add the 'Status' column
+            }
+            for key in unmatched_non_prefixed_keys if key not in all_matched_keys
+        )
+
+        print(f"Close matches found (similarity >= {similarity_threshold}%): {close_match_count}")
+
+    except ValueError as e:
+        print(f"Error loading file: {e}")
+
+print(f"\nTotal unique keys in FDE files: {total_keys_in_FDE}")
+print(f"Total unique keys in non-prefixed files: {total_keys_in_non_prefixed}")
+print(f"Total exact matches: {total_exact_matches}")
+print(f"Total close matches (similarity >= {similarity_threshold}%): {total_close_matches}")
+print(f"Total truly unmatched keys: {len(unmatched_keys_output)}")
+
+if exact_matches_output:
+    # Convert to DataFrame for processing
+    exact_matches_df = pd.DataFrame(exact_matches_output)
+    
+    # Ensure School ID is extracted and present in the output
+    exact_matches_df['School ID'] = exact_matches_df['File1'].apply(extract_school_id)
+    
+    # Group by School ID and save separate files
+    for school_id, group_df in exact_matches_df.groupby('School ID'):
+        output_file_name = f"{school_id}_exact_matches.csv"
+        group_df.to_csv(output_file_name, index=False)
+        print(f"Exact matches for School ID {school_id} saved to {output_file_name}")
+
+# Group close_matches_output by School ID and write separate files
+# Add the Key ID column before saving close_matches_output
+if close_matches_output:
+    # Convert to DataFrame for processing
+    close_matches_df = pd.DataFrame(close_matches_output)
+
+    # Add the Key ID column by extracting the first part of the Key
+    close_matches_df['Key ID'] = close_matches_df.apply(
+        lambda row: get_pk_from_key(row['FDE Key']) if row['FDE Key'] != "<No Match>" 
+        else get_pk_from_key(row['ABC Key']), axis=1
+    )
+
+    # Ensure School ID is extracted and present in the output
+    close_matches_df['School ID'] = close_matches_df['File1'].apply(extract_school_id)
+
+    # Add Isbbb column: 1 if File1 contains 'bbb', else 0
+    close_matches_df['Isbbb'] = close_matches_df['File1'].apply(
+        lambda filename: 1 if 'bbb' in filename else 0
+    )
+
+    # Add Start Date and End Date columns for bbb rows
+    def extract_contract_dates(row):
+        if row['Isbbb'] == 1:
+            key_to_use = row['FDE Key'] if row['FDE Key'] != "<No Match>" else row['ABC Key']
+            key_parts = key_to_use.split("|") if key_to_use else []
+            start_date = key_parts[2] if len(key_parts) > 2 else "<empty>"  # Adjust index based on key structure
+            end_date = key_parts[4] if len(key_parts) > 4 else "<empty>"    # Adjust index based on key structure
+            return pd.Series([start_date, end_date])
+        return pd.Series([None, None])
+
+    close_matches_df[['Start Date', 'End Date']] = close_matches_df.apply(
+        extract_contract_dates, axis=1
+    )
+
+    # Add Missing xytzt Date column
+    def is_missing_xytzt(row, blank_xytzt_data):
+        file_school_id = row['School ID']
+        key_id = row['Key ID']
+        for file_name, blank_keys in blank_xytzt_data.items():
+            if extract_school_id(file_name) == file_school_id and key_id in blank_keys:
+                return 1  # Missing xytzt Date
+        return 0  # xytzt Date is present or not a AVBAVB file
+
+    close_matches_df['Missing xytzt Date'] = close_matches_df.apply(
+        lambda row: is_missing_xytzt(row, aaa_blank_xytzt_data), axis=1
+    )
+
+    # Update Missing xytzt Info
+    def update_missing_xytzt_info(row):
+        if row['Missing xytzt Date'] == 1:
+            row['Issue Column'] = "Missing xytzt Date in ABC AVBAVB Core"
+            row['Differences'] = "Missing xytzt Date in ABC AVBAVB Core"
+            row['Note'] = "Missing xytzt Date in ABC AVBAVB Core"
+            row['Match Status'] = "Missing xytzt Date in ABC AVBAVB Core"
+        return row
+
+    close_matches_df = close_matches_df.apply(update_missing_xytzt_info, axis=1)
+
+    def find_and_add_matching_rows(df):
+        # Filter rows based on "Missing in ABC" and "Missing in FDE"
+        missing_in_FDE = df[df['Note'] == "Missing in FDE"]
+        missing_in_ABC = df[df['Note'] == "Missing in ABC"]
+
+        # Create a dictionary to store matches
+        matches = {}
+
+        # Iterate through "Missing in FDE" rows and find matching "Missing in ABC" rows
+        for _, FDE_row in missing_in_FDE.iterrows():
+            FDE_key_id = FDE_row['Key ID']
+            FDE_start_date = FDE_row['Start Date']
+            FDE_end_date = FDE_row['End Date']
+
+            # Match based on enhanced criteria
+            matching_ABC_rows = missing_in_ABC[
+                (missing_in_ABC['Key ID'] == FDE_key_id) &  # Match Key IDs
+                (missing_in_ABC['Start Date'] == FDE_start_date) &  # Match Start Dates
+                (missing_in_ABC['End Date'] == FDE_end_date)  # Match End Dates
+            ]
+
+            if not matching_ABC_rows.empty:
+                # Extract only the relevant parts and format as a string
+                matching_row = matching_ABC_rows.iloc[0]
+                matches[FDE_row.name] = f"{matching_row['FDE Key']}"
+
+        # Add a new column to store matching rows
+        df['Second Iteration Matching Row'] = df.index.map(lambda idx: matches.get(idx, ""))
+
+        return df
+
+
+    # Apply the new matching logic
+    close_matches_df = find_and_add_matching_rows(close_matches_df)
+
+    # Update the FDE Key and Note for second iteration matches
+    def update_second_iteration_matches(row):
+        if row['Second Iteration Matching Row'] and row['FDE Key'] == "<No Match>":
+            row['FDE Key'] = row['Second Iteration Matching Row']
+            row['Note'] = "Key matched in second iteration"
+        return row
+
+    close_matches_df = close_matches_df.apply(update_second_iteration_matches, axis=1)
+
+    def compare_keys_for_mismatches(row):
+        """
+        Compare ABC Key and FDE Key, and populate Issue Column and Differences.
+        Retrieves proper column names from the Field Names column for mismatches.
+        """
+        if row['Note'] == "Key matched in second iteration" or "Matching on Key" in row['Note']:
+            ABC_key_parts = row['ABC Key'].split('|')
+            FDE_key_parts = row['FDE Key'].split('|')
+
+            # Extract and clean Field Names into a list
+            field_names = [name.strip() for name in row['Field Names'].split(',')]
+
+            issue_columns = []
+            differences = []
+
+            # Iterate and compare ABC and FDE key parts
+            for i, (ABC_part, FDE_part) in enumerate(zip(ABC_key_parts, FDE_key_parts)):
+                if ABC_part != FDE_part:
+                    # Safely get the field name; fallback to "Unknown Column"
+                    column_name = field_names[i] if i < len(field_names) else f"Column {i+1}"
+                    issue_columns.append(column_name)
+                    differences.append(
+                        f"Column '{column_name}' mismatch: ABC Value '{ABC_part}' -> FDE Value '{FDE_part}'"
+                    )
+
+            # Join results into strings
+            issue_column_str = ", ".join(issue_columns) if issue_columns else row.get('Issue Column', '')
+            differences_str = "; ".join(differences) if differences else row.get('Differences', '')
+
+            return issue_column_str, differences_str
+
+        # If no match logic applies, retain kkkkal data
+        return row['Issue Column'], row['Differences']
+
+
+
+    # Apply the updated function to populate Issue Column and Differences columns
+    def apply_mismatch_updates(row):
+        issue_column, differences = compare_keys_for_mismatches(row)
+        if issue_column:
+            row['Issue Column'] = issue_column
+        if differences:
+            row['Differences'] = differences
+        return row
+
+    # Apply it to the DataFrame
+    close_matches_df = close_matches_df.apply(apply_mismatch_updates, axis=1)
+
+    # Remove redundant rows after second iteration matching
+    def remove_redundant_rows(df):
+        """
+        Removes rows with 'No Match' if a matching row is found in the re-matching process.
+        """
+        # Identify rows with valid matches
+        valid_matches = set(df[df['Second Iteration Matching Row'] != ""]['Second Iteration Matching Row'])
+
+        # Remove rows with 'No Match' if their keys are present in valid_matches
+        filtered_df = df[~(
+            (df['ABC Key'].isin(valid_matches) & (df['FDE Key'] == '<No Match>')) |
+            (df['FDE Key'].isin(valid_matches) & (df['ABC Key'] == '<No Match>'))
+        )]
+
+        return filtered_df
+
+    close_matches_df = remove_redundant_rows(close_matches_df)
+
+    # Drop unnecessary columns
+    close_matches_df = close_matches_df.drop(columns=['Missing xytzt Date', 'Match Status'])
+
+    # Group by School ID and save separate files
+    for school_id, group_df in close_matches_df.groupby('School ID'):
+        output_file_name = f"{school_id}_close_matches.csv"
+        group_df.to_csv(output_file_name, index=False)
+        print(f"Close matches with mismatches for School ID {school_id} saved to {output_file_name}")
+
+
+if unmatched_keys_output:
+    # Convert to DataFrame for processing
+    unmatched_keys_df = pd.DataFrame(unmatched_keys_output)
+    
+    # Ensure School ID is extracted and present in the output
+    unmatched_keys_df['School ID'] = unmatched_keys_df['File'].apply(extract_school_id)
+    
+    # Group by School ID and save separate files
+    for school_id, group_df in unmatched_keys_df.groupby('School ID'):
+        output_file_name = f"{school_id}_unmatched_keys.csv"
+        group_df.to_csv(output_file_name, index=False)
+        print(f"Unmatched keys for School ID {school_id} saved to {output_file_name}")
+
+print("\nComparison of Key columns is complete. Results have been saved to CSV files.")
